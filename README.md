@@ -58,3 +58,47 @@ I think a dual purpose server / wrapper executable makes sense; so usage would b
 
 The Nginx-based `apt` proxy stuff isn't a requirement, it's just me playing around and it also helps to keep iteration
 times down given a lot of testing is all about clearing caches and building again to see what happens.
+
+## What the cluster measured
+
+Three libvirt nodes, a throwaway two-stage Go repo, and `--cache-to` as the only variable.  Every run starts from a
+restored snapshot, so "cold" really means cold.  `./test_all.sh` reproduces all of it; the numbers below are one run.
+
+`type=local` - a cache directory per commit, replicated node to node (`test/file-cache.sh`):
+
+- one commit's export is the whole cache: 147 MB in 10 files
+- a one-line change puts 1.4 MB of genuinely new content into it, and the export is still 147 MB
+- moving that commit to another node puts 147 MB on the wire: **105x amplification**
+- the third node costs another 147 MB, whether or not it needs any of it
+- wall clock per replication is 0-15s depending on whether the export is still in the host's page cache, so the bytes,
+  not the seconds, are the honest measure - and the bytes scale with the size of everything ever built
+
+The directory is not content addressed: the export writes a fresh copy of every layer, so "replicate the cache" means
+"copy all of it".  That is the whole cost of the file design, and no amount of clever transfer wins against it.
+
+`type=registry` - one ref per branch+commit (`test/registry-cache.sh`, `test/registry-up.sh`):
+
+- first commit: ref is 161 MB, replication moves 162 MB (one time)
+- second commit, one line in `app.go`: registry grows 2.9 MB, replication moves 3.0 MB, node2 builds in 3s
+- a node with no replicated anything builds in 2s by naming someone else's registry, pulling 119 MB - only the layers
+  the build materialises, not the 161 MB the ref contains
+- three refs over four distinct layers occupy 284 MB, not 3x161 MB: blobs are shared between refs
+
+An old branch is where the naming earns its keep.  `flight/v1.25` was cut at the first commit and has its own
+dependency layer; a fix lands on it after master has moved on, and node2 has never seen the branch:
+
+- `--cache-from` the branch's own commit ref: 11s, 2 cached steps
+- `--cache-from` master's newest ref, which is what a "latest" key gives you: 46s, 0 cached steps
+
+Same node, same registry, same build; the only difference is which ref was named.  Content addressing takes care of
+what to transfer, and the commit graph has to take care of what to name.
+
+What this changes about the concept above:
+
+- the cache object is a registry ref, not a directory: `--cache-from`/`--cache-to type=registry,mode=max`, and
+  ddcache never invents a file layout, a transfer format, or a dedup strategy
+- refs are named `cache-<branch>-<commit>`, written only by the build of that commit, so concurrent builds never
+  contend for one "latest" cache; a build asks for its branch's ref plus whatever the merge base suggests
+- replication becomes a small policy problem - which refs on which node, and when - instead of a bandwidth problem
+- the sharp edge moves to storage: every branch ref stays in the registry forever unless something prunes it, and
+  registry:2 here has GC disabled, so the spike never had to pay for keeping them
