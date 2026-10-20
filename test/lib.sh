@@ -4,14 +4,15 @@ set -euo pipefail
 
 # Shared helpers for the tests in test/.  Sourced, not executed.
 #
-# Everything here talks to the Vagrant cluster: host -> node over the
-# forwarded SSH ports (12231-12233), node -> node over the private network
-# (192.168.78.x) with the cluster key the Vagrantfile provisions.
+# Everything here talks to the Vagrant cluster over its private network
+# (192.168.78.11-13), with the per-machine key vagrant left in .vagrant.
+# Node -> node ssh uses the cluster key the Vagrantfile provisions.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 NODES=(node1 node2 node3)
+NODE_SUBNET="192.168.78"
 SPIKE_SRC="test/spike"
 
 failures=0
@@ -52,17 +53,20 @@ check_absent() {
 }
 
 node_init() {
-	local n=$1 cfg
+	local n=$1
 	[[ -n "${NODE_PORT[$n]:-}" ]] && return 0
 
-	cfg="$(vagrant ssh-config "$n")"
-	NODE_HOST[$n]="$(sed -n 's/^[[:space:]]*HostName \([^ ]*\).*/\1/p' <<<"$cfg")"
-	NODE_PORT[$n]="$(sed -n 's/^[[:space:]]*Port \([^ ]*\).*/\1/p' <<<"$cfg")"
-	NODE_USER[$n]="$(sed -n 's/^[[:space:]]*User \([^ ]*\).*/\1/p' <<<"$cfg")"
-	NODE_KEY[$n]="$(sed -n 's/^[[:space:]]*IdentityFile \([^ ]*\).*/\1/p' <<<"$cfg")"
+	# The private address is static in the Vagrantfile, so it needs nothing from
+	# vagrant or libvirt to know it.  `vagrant ssh-config` can report a running,
+	# reachable guest as having no IP once the DHCP lease database goes stale,
+	# which is a bad thing for a test run to depend on.
+	NODE_HOST[$n]="${NODE_SUBNET}.1${n#node}"
+	NODE_PORT[$n]=22
+	NODE_USER[$n]=vagrant
+	NODE_KEY[$n]="$(ls .vagrant/machines/"$n"/*/private_key 2>/dev/null | head -1)"
 
-	[[ -n "${NODE_HOST[$n]}" && -n "${NODE_PORT[$n]}" ]] || {
-		echo "test: could not read ssh config for $n" >&2
+	[[ -n "${NODE_KEY[$n]}" ]] || {
+		echo "test: no ssh key for $n, is the cluster up?" >&2
 		exit 1
 	}
 }
@@ -215,4 +219,10 @@ report() {
 		printf '\033[31m%d check(s) failed\033[0m\n' "$failures"
 	fi
 	return "$failures"
+}
+
+# Logs are the only evidence a measurement is what it claims to be, so they
+# survive a failed run and go with the pass.
+preserve_logs_on_failure() {
+	trap "rc=\$?; if ((rc)); then printf 'test: logs kept in $1\n' >&2; else rm -rf '$1'; fi" EXIT
 }

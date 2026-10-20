@@ -9,7 +9,7 @@ set -e
 for t in test/*.sh; do
 	name="${t#test/}"
 	name="${name%.sh}"
-	[[ "$name" == lib ]] && continue
+	[[ "$name" == *lib ]] && continue
 
 	echo "=== $t ==="
 	./test.sh restore "$name"

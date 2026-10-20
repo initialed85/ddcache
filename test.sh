@@ -39,7 +39,7 @@ fi
 test_script="test/${which_test}.sh"
 [[ -f "$test_script" ]] || {
 	echo "test.sh: no such test '$which_test' (looked for $test_script)" >&2
-	ls test/*.sh | sed 's|test/||; s|\.sh$||; s/^/  /' >&2
+	ls test/*.sh | grep -v "lib.sh$" | sed 's|test/||; s|\.sh$||; s/^/  /' >&2
 	exit 1
 }
 
