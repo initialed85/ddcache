@@ -44,3 +44,17 @@ I think a dual purpose server / wrapper executable makes sense; so usage would b
     - e.g. `ln -s ${PWD}/ddcache-to /tmp/ddcache/initialed85/ttyd/latest/${stream}/${this_commit}`
   - Execute the described Docker build with the `--cache-from` and `--cache-to` flags as necessary
   - Hand off to `ddcache serve` for the slow task of coordination replicating
+
+## Tradeoffs / deliberate choices / otherwise expected and accepted sharp edges
+
+- Nothing will be compressed, to keep CPU usage down on nodes that are probably important build machines
+- This will not be efficient from a storage perspective
+- This will not be efficient from a network perspective
+- The lever we're pulling is all about making Docker builds as fast as we can
+- Some cache misses are inevitable due to the asynchronous design
+- Tie-breaking for same-build, same-commit will be one by timestamp
+
+## Dev notes
+
+The Nginx-based `apt` proxy stuff isn't a requirement, it's just me playing around and it also helps to keep iteration
+times down given a lot of testing is all about clearing caches and building again to see what happens.
