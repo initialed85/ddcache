@@ -17,7 +17,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 LOG_DIR="$(mktemp -d /tmp/ddcache-test.XXXXXX)"
-trap 'rm -rf "$LOG_DIR"' EXIT
+preserve_logs_on_failure "$LOG_DIR"
 
 CACHE_ARGS="mode=max,compression=zstd,force-compression=true"
 SRC=/home/vagrant/spike
