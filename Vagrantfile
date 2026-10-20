@@ -182,6 +182,15 @@ Vagrant.configure("2") do |config|
         if File.exist?("/dev/kvm")
           lv.driver = "kvm"
         end
+        # vagrant-libvirt's default, host-model, writes <cpu mode='custom'> with
+        # both a <model> and a <vendor> into the domain.  Any later redefine of
+        # the same domain - a `vagrant reload`, or `vagrant up` after a
+        # `virsh save`/`restore` cycle - regenerates that XML without the model
+        # and libvirt refuses it: "CPU vendor specified without CPU model".
+        # host-passthrough has no vendor element, so the cluster stays
+        # manageable after snapshot churn.  These are spike nodes on one host,
+        # so exposing the host CPU is fine.
+        lv.cpu_mode = "host-passthrough"
         if UEFI_CODE
           lv.loader = UEFI_CODE
           lv.nvram  = "/var/lib/libvirt/qemu/nvram/#{name}_ddcache_VARS.fd"

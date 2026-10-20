@@ -467,6 +467,14 @@ cmd_status() {
 	require_vagrant
 	echo "env.sh: provider=${provider:-<none>} host=$platform/$arch"
 	vagrant status
+	local n
+	for n in $(vagrant_vm_names); do
+		if node_ssh_ready "$n"; then
+			echo "env.sh: $n ssh ok at $(node_address "$n")"
+		else
+			echo "env.sh: $n not answering ssh at $(node_address "$n")" >&2
+		fi
+	done
 	[[ -d "$VAGRANT_SNAPSHOT_DIR" ]] && ls -1 "$VAGRANT_SNAPSHOT_DIR"/*.save 2>/dev/null |
 		sed 's|.*/||; s|\.save$||; s|^|env.sh: snapshot |' || true
 }
@@ -477,21 +485,32 @@ cmd_vagrant() {
 }
 
 # Wait for ssh to come back on every node.  A restore reboots (or resumes)
-# guests, and every test starts by talking to them.  We ask vagrant how to
-# reach each node rather than assuming localhost:1223x, because the providers
-# disagree about which of the two is the real answer.
+# guests, and every test starts by talking to them.
+#
+# The nodes are addressed by their static private-network address, not by what
+# `vagrant ssh-config` says.  vagrant only knows an address while libvirt is
+# holding a DHCP lease for the guest, and after a few `virsh save`/`restore`
+# cycles the lease database is empty: the guest is running and reachable, but
+# vagrant reports it as having no IP and refuses to hand out ssh config.
+NODE_SUBNET="192.168.78"
+
+node_address() {
+	local n=$1
+	echo "${NODE_SUBNET}.1${n#node}"
+}
+
+node_key() {
+	local n=$1
+	ls .vagrant/machines/"$n"/*/private_key 2>/dev/null | head -1
+}
+
 node_ssh_ready() {
-	local n=$1 cfg host port user key
+	local n=$1 key
+	key="$(node_key "$n")"
+	[[ -n "$key" ]] || return 1
 
-	cfg="$(vagrant ssh-config "$n" 2>/dev/null)" || return 1
-	host="$(sed -n 's/^[[:space:]]*HostName \([^ ]*\).*/\1/p' <<<"$cfg")"
-	port="$(sed -n 's/^[[:space:]]*Port \([^ ]*\).*/\1/p' <<<"$cfg")"
-	user="$(sed -n 's/^[[:space:]]*User \([^ ]*\).*/\1/p' <<<"$cfg")"
-	key="$(sed -n 's/^[[:space:]]*IdentityFile \([^ ]*\).*/\1/p' <<<"$cfg")"
-	[[ -n "$host" && -n "$port" ]] || return 1
-
-	ssh -i "$key" -p "$port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-		-o ConnectTimeout=2 "$user@$host" true >/dev/null 2>&1
+	ssh -i "$key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+		-o ConnectTimeout=2 "vagrant@$(node_address "$n")" true >/dev/null 2>&1
 }
 
 wait_for_nodes() {
