@@ -103,6 +103,27 @@ what to transfer, and the commit graph has to take care of what to name.
   already hold the ref prints "nothing to send".  There is no event stream, so there is nothing to echo back.
 - `flight/v1.25`, which has its own dependency layer, costs that layer and nothing else: 115 MB
 
+The link, made slow and made to die (`test/registry-blocking.sh`).  `tc htb`/`netem` shapes node1's egress; the ref is
+the same 161 MB one commit:
+
+| link from the peer | fetch a whole ref | the build after it | on demand, start to finished image |
+|---|---|---|---|
+| unshaped (0.15ms RTT) | 1s, 162 MB | 11s | 12s |
+| 1 gbit, 500us | 2s, 162 MB | 11s | 13s |
+| 200 mbit, 15ms | 7s, 162 MB | 12s | 19s |
+| 50 mbit, 15ms, wire cut at 4s | fails after 21 MB | 43s, 0 steps cached | 43s |
+
+Two things this shape out.  **Fetching ahead of the build and prefetching by the reconciler are the same cost, not the
+same risk**: at 200 mbit the prefetch wins by 1s of wall and, when it wins, it wins because the build never touches the
+network - so the interesting difference is that a prefetch can be abandoned and a build-time fetch cannot.  **The next
+commit is not the interesting one**: steady state moves 3.0 MB in 0s, because content addressing already knows which
+layers the peer is missing; the cold-node case is the one the shaping is measuring.
+
+A mid-fetch failure is the case no tag list protects against - the peer answered, was named, and then stopped serving
+while the bytes were coming.  The build does not depend on that peer: `docker.sh` names each fetch that failed, imports
+nothing, and builds anyway.  The cost is a cold build (43s, 0 cached steps against 11s warm), which is the same price as
+never having had a cache, not a lost CI run.
+
 ## Driving it by hand
 
 ```
@@ -126,6 +147,10 @@ What this changes about the concept above:
 
 - the cache object is a registry ref, not a directory: `--cache-from`/`--cache-to type=registry,mode=max`, and
   ddcache never invents a file layout, a transfer format, or a dedup strategy
+- a build never reads cache over the network.  `docker.sh` copies the ref it wants into its *own* registry first (one
+  bounded, timed, byte-counted wait) and then points BuildKit at localhost.  BuildKit's own remote `--cache-from` was
+  the alternative: it works, but a peer that is slow makes a build hang in a way the tool cannot time, name, or abandon,
+  and a build that hangs on someone else's machine is a cache that has become a dependency
 - refs are named `cache-<branch>-<commit>`, written only by the build of that commit, so concurrent builds never
   contend for one "latest" cache; a build asks for its branch's ref plus whatever the merge base suggests
 - replication becomes a small policy problem - which refs on which node, and when - instead of a bandwidth problem

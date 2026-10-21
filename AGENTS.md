@@ -43,10 +43,15 @@ which exists to make measurements honest rather than to model the real fleet.
 ```
 
 - `tools/` is the node side of the spike, run as `vagrant` on a node:
-  `docker.sh` (name the ref for the commit, ask the cluster what to import,
-  build, replicate) and `reconcile.sh` (pull the refs this registry is missing).
+  `docker.sh` (name the ref for the commit, fetch the cache it wants into its own
+  registry, build against localhost, then replicate unless `--local`) and
+  `reconcile.sh` (pull the refs this registry is missing, optionally preferring
+  what a checkout is about to ask for with `--watch <dir>`).
   `tools/deploy.sh` is the host side and is idempotent; run it after a restore,
   which rolls the nodes' disks back and takes all of it with it.
+- The suites that drive them: `./test.sh restore registry-cache` (naming and
+  transport), `registry-reconcile` (async convergence), `registry-blocking`
+  (shaped links, silent peers, a wire cut mid-fetch).
 
 - Nodes: `node1` `node2` `node3`, reached by their static private addresses
   `192.168.78.11-13` with the per-machine key in `.vagrant/machines/<node>/`.
@@ -109,6 +114,26 @@ which exists to make measurements honest rather than to model the real fleet.
   `tools/common.sh: copy_ref` measures on the interface facing the *peer*.
 - `test/lib.sh` and `test/registry-lib.sh` are sourced, not run: `test.sh` and
   `test_all.sh` skip anything named `*lib.sh`.
+- Killing the *sender* does not kill the transfer.  `docker kill registry` on a
+  peer leaves an in-flight `skopeo copy` running: the kernel keeps serving
+  already-buffered socket data, and the copy finishes as if nothing happened, so
+  a "peer died" test built that way measures a healthy cluster.  Simulate the
+  failure on the *reader*: `iptables ... -j REJECT --reject-with tcp-reset` on
+  its own INPUT/OUTPUT for that peer's `:5000`, which is how you make a transport
+  fail in front of you.  `test/registry-lib.sh: link_dies/link_lives`.
+- Do not detect a remote build's completion by grepping a log you backgrounded
+  over ssh.  An earlier draft of `registry-blocking.sh` did `setsid ... >log &`
+  and polled the log for `built in`, and a leftover log from the previous run
+  made the stage report "fetched 157MB in 27s" while the byte counters said 0 MB
+  arrived.  Run the build in the foreground, cut the link from a background
+  subshell on the host, and read counters at both ends (`rx_bytes` on the reader,
+  `tx_bytes` on the peer) so neither side's account is taken on trust.
+- `reconcile.sh`'s "already home" map has to be keyed in the same form
+  `inventory` answers with (a bare tag).  Keyed by full ref it never matched, and
+  every pass "brought over" refs that were already there - cheap, because skopeo
+  skips blobs the destination has, but it filled the log with copies that moved
+  6 KB and it made the idle-cluster claim false.  A line in a log is a claim: the
+  test that asserts on it is what finds this.
 
 ## Known measurements
 
@@ -164,6 +189,23 @@ add to the list rather than arguing with it.
   moved 155 MB, the next commit 3.0 MB (and grew the destination registry 6.0 MB
   on disk), and the branch commit with its own dependency layer 115 MB.  Counted
   by ref, every one of those would have been the whole cache.
+- Shaped from the peer's egress (`test/registry-blocking.sh`, 161 MB ref): fetch
+  1s unshaped, 2s at 1gbit/500us, 7s at 200mbit/15ms; the build after it is 11-12s
+  in every case.  Fetching ahead of the build and prefetching it are the same
+  cost (19s vs 18s overall at 200mbit, 13s vs 13s at 1gbit) - the difference is
+  that the prefetch is off the critical path of the build, and one number in that
+  suite is deliberately reported as a tie rather than a win.
+- `tc` matches the rate and never the latency: this link answers at 23 MB/s where
+  asked for 200mbit (25 MB/s), but the RTT is what the shaping cannot synthesize
+  between three VMs on one host (0.15ms unshaped, netem adds the one-way delay).
+  Cross-AZ cloud figures want real distance, or an iperf3-backed link.
+- A peer dying mid-fetch costs a cold build, not a failed one: 21 MB had arrived
+  when the wire was cut, `docker.sh` named all four failed fetches, imported
+  nothing, and built in 43s with 0 cached steps (against 11s warm).  Cache stays
+  an optimisation on the critical path of nothing.
+- Fetching the nearest ref alone is enough: a `mode=max` ref carries its
+  ancestors' layers, so walking the whole parent chain cost 168 MB where 155 MB
+  bought the same build.  `docker.sh` stops after the first one it can use.
 
 ## Git discipline
 
