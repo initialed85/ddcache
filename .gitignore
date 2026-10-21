@@ -3,3 +3,4 @@ nginx/apt-cache
 .vagrant/
 cache
 cache-*/
+logs/
