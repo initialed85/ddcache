@@ -17,7 +17,7 @@ which exists to make measurements honest rather than to model the real fleet.
 - Ed is working alongside you, probably in `build.sh`, `README.md` and
   `test/Dockerfile` at the root of the repo - those are his original spike
   files, ask before rewriting them. The harness (`Vagrantfile`, `env.sh`,
-  `test.sh`, `test/`) is yours to keep working.
+  `test.sh`, `test/`, `tools/`) is yours to keep working.
 - Branches: `master` is the dev environment plus the file-based (BuildKit
   `type=local`) proof. `registry` is the registry-based spike, which is where
   the interesting comparison lives.
@@ -39,10 +39,19 @@ which exists to make measurements honest rather than to model the real fleet.
 ./env.sh restore   # every node back to empty caches, ~8s
 ./env.sh status
 ./test.sh restore file-cache
+./tools/deploy.sh  # put tools/ + registries + a playground repo on the nodes
 ```
+
+- `tools/` is the node side of the spike, run as `vagrant` on a node:
+  `docker.sh` (name the ref for the commit, ask the cluster what to import,
+  build, replicate) and `reconcile.sh` (pull the refs this registry is missing).
+  `tools/deploy.sh` is the host side and is idempotent; run it after a restore,
+  which rolls the nodes' disks back and takes all of it with it.
 
 - Nodes: `node1` `node2` `node3`, reached by their static private addresses
   `192.168.78.11-13` with the per-machine key in `.vagrant/machines/<node>/`.
+  `./tools/deploy.sh` writes `.vagrant/ssh_config` so `ssh -F .vagrant/ssh_config
+  ddn1` is the short form.
   Ports 12231-12233 are forwarded too, but nothing uses them: see Traps.
   `vagrant` -> `vagrant` passwordless ssh between every pair over the private
   network (`.vagrant/cluster_key`). The subnet and port range differ from
@@ -89,6 +98,15 @@ which exists to make measurements honest rather than to model the real fleet.
   `test/registry-lib.sh: node_allow_insecure` restarts dockerd only when the
   config actually changed, because a restart drops the builder.
 - `skopeo copy` takes `--src-tls-verify=false`, not `--src-tlsverify`.
+- A guest restored from saved state comes back with its clock stopped where the
+  snapshot left it.  Hours of skew is enough for apt to refuse Ubuntu's own
+  Release file - `Release file ... is not valid yet (invalid for another 3h)` -
+  which reads exactly like a broken mirror.  `env.sh` steps each node's clock to
+  the host's after a restore, and `require_cluster` fails the run if any node is
+  more than 120s off, so it cannot quietly become a mysterious build failure.
+- Traffic counters: `ip route get <this node's own address>` answers `dev lo`, so
+  measuring a transfer on the "route to the source" of a push reports 0 bytes.
+  `tools/common.sh: copy_ref` measures on the interface facing the *peer*.
 - `test/lib.sh` and `test/registry-lib.sh` are sourced, not run: `test.sh` and
   `test_all.sh` skip anything named `*lib.sh`.
 
@@ -134,6 +152,18 @@ add to the list rather than arguing with it.
   as a `type=local` one (46s vs 50s cold, 9s vs 10s warm): BuildKit pushes
   layers as it builds them instead of writing them out at the end, and the
   transport is local.
+- The asynchronous design works with nobody advising anybody. `test/registry-reconcile.sh`
+  has node1 build with `--local` (no push at all), and node2's reconciler - which
+  only compares "refs the cluster has" against "refs I have" - pulls the ref 1s
+  later and builds the same binary in 12s against node1's 45s cold.
+- Repeated reconciliation is free once it has converged: two passes over an idle
+  cluster report 0 refs brought over and move no bytes, which is why the loop can
+  run on a timer instead of reacting to events.  A push to a peer that already has
+  the ref prints "nothing to send" and costs one tag-list request.
+- What replication costs per commit is the new data, not the ref: the first ref
+  moved 155 MB, the next commit 3.0 MB (and grew the destination registry 6.0 MB
+  on disk), and the branch commit with its own dependency layer 115 MB.  Counted
+  by ref, every one of those would have been the whole cache.
 
 ## Git discipline
 

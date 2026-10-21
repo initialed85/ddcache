@@ -93,6 +93,35 @@ dependency layer; a fix lands on it after master has moved on, and node2 has nev
 Same node, same registry, same build; the only difference is which ref was named.  Content addressing takes care of
 what to transfer, and the commit graph has to take care of what to name.
 
+`docker.sh` and `reconcile.sh` - the async half, actually running (`test/registry-reconcile.sh`):
+
+- node1 builds a commit cold in 45s, exports it to its own registry, and - given `--local` - pushes nothing to anyone
+- node2 has a reconciler standing there that only asks "which refs does the cluster have that I don't"; it pulls the
+  ref 1s later, and builds the same commit in 12s and the same binary digest
+- the next commit costs 3.0 MB on the wire and 6.0 MB of disk on node2, against a 155 MB ref
+- an idle cluster moves nothing: passes over a converged cluster report 0 refs brought over, and a build whose peers
+  already hold the ref prints "nothing to send".  There is no event stream, so there is nothing to echo back.
+- `flight/v1.25`, which has its own dependency layer, costs that layer and nothing else: 115 MB
+
+## Driving it by hand
+
+```
+./env.sh restore && ./tools/deploy.sh        # nodes, registries, tools, ~/repo on each
+ssh -F .vagrant/ssh_config ddn1              # ddn1-3 -> 192.168.78.11-13, per-machine key
+cd ~/repo && git checkout flight/v1.25
+~/ddcache/docker.sh --print .                # what it would build, and from which refs
+~/ddcache/docker.sh .                        # build it, then hand the ref to the peers
+~/ddcache/docker.sh --local .                # build it, let a reconciler notice instead
+ssh -F .vagrant/ssh_config ddn2 '~/ddcache/reconcile.sh --once --verbose'
+node2$ git fetch origin && git checkout -B flight/v1.25 origin/flight/v1.25
+node2$ ~/ddcache/docker.sh .                 # warm, out of its own registry
+```
+
+`deploy.sh` is idempotent and cheap; run it after every restore, which rolls the node disks back and takes the tools,
+registries and repos with them.  `~/repo` on node1 is the origin; the other nodes cloned it, so a commit made on node1
+reaches node2 with an ordinary `git fetch`.  Add `Include /home/edward/Projects/Home/ddcache/.vagrant/ssh_config` to
+your `~/.ssh/config` if you would rather type `ssh ddn1`.
+
 What this changes about the concept above:
 
 - the cache object is a registry ref, not a directory: `--cache-from`/`--cache-to type=registry,mode=max`, and
@@ -100,5 +129,8 @@ What this changes about the concept above:
 - refs are named `cache-<branch>-<commit>`, written only by the build of that commit, so concurrent builds never
   contend for one "latest" cache; a build asks for its branch's ref plus whatever the merge base suggests
 - replication becomes a small policy problem - which refs on which node, and when - instead of a bandwidth problem
+- `serve` does not need to advise anyone of anything, or hold a peer list: state converges when each node compares
+  "what the cluster has" against "what I have" on a timer.  A lost notification costs one interval, which is the
+  whole point of the async design; `join`/`leave` is a line in a file
 - the sharp edge moves to storage: every branch ref stays in the registry forever unless something prunes it, and
   registry:2 here has GC disabled, so the spike never had to pay for keeping them
