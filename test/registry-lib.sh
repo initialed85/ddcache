@@ -195,3 +195,106 @@ checkout_node() {
 		# shellcheck disable=SC2046
 		ssh $(ssh_opts "$n") "${NODE_USER[$n]}@${NODE_HOST[$n]}" "tar -xm -C $SRC_DIR"
 }
+
+# The shared half of the tests that drive tools/ on the nodes: the deploy, a
+# build through docker.sh, and the reconciler.  built() writes into LOG_DIR, so
+# a caller that uses it has to set that first.
+TOOLS=/home/vagrant/ddcache
+REPO=/home/vagrant/repo
+BUILT_N=0
+
+deploy_tools() {
+	local n list=""
+	for n in "${NODES[@]}"; do
+		ensure_insecure_registries "$n"
+		ensure_registry "$n"
+		node_put "$n" "$REPO_ROOT/tools" "$TOOLS"
+		node_bash "$n" "chmod +x $TOOLS/*.sh"
+	done
+	for n in "${NODES[@]}"; do
+		node_init "$n"
+		list+="${NODE_HOST[$n]}"$'\n'
+	done
+	for n in "${NODES[@]}"; do
+		node_ssh "$n" "cat >$TOOLS/nodes" <<<"$list"
+		node_ssh "$n" "cat >$TOOLS/env" <<<"APT_PROXY=${APT_PROXY:-}"
+	done
+}
+
+
+# built <node> <args...> : run docker.sh on a node and take the numbers out of what
+# it printed rather than re-deriving them from docker.  WALL, CACHED, REF and FROM
+# are set; FROM is what it chose to import, which is the whole point.
+WALL=0
+CACHED=0
+REF=
+FROM=
+BUILT_N=0
+built() {
+	local n=$1 out status=0
+	WALL=0
+	FETCH=0
+	CACHED=0
+	REF=
+	FROM=
+	out=$(node_bash "$n" "cd $REPO && ~/ddcache/docker.sh $* ." 2>&1) || status=$?
+	# the build log goes to file, the tool's own lines go to the report
+	BUILT_N=$((BUILT_N + 1))
+	printf '%s\n' "$out" >"$LOG_DIR/docker-$n-$BUILT_N.log"
+	node_bash "$n" "cat /tmp/ddcache-build.log" >"$LOG_DIR/build-$n-$BUILT_N.log" 2>/dev/null || true
+	# a failed build has to say so on the report, not die quietly inside $( )
+	if ((status)); then
+		printf '      docker.sh failed on %s, last of its output:\n' "$n"
+		tail -25 <<<"$out" | sed 's/^/        /'
+		return "$status"
+	fi
+	grep '^docker.sh: ' <<<"$out" | sed 's/^/      /' || true
+	WALL=$(grep -oP '(?<=built in )\d+' <<<"$out" || true)
+	# What the network cost, timed by the tool itself rather than inferred from the
+	# wall clock: docker.sh prints one line per ref it had to bring over first.
+	FETCH=$(grep 'docker.sh: fetched' <<<"$out" | grep -oP '(?<=in )\d+' |
+		awk '{ s += $1 } END { print s + 0 }' || true)
+	CACHED=$(grep -oP '(?<=, )\d+(?= steps were cached)' <<<"$out" || true)
+	REF=$(grep -oP '(?<=ref  )\S+' <<<"$out" || true)
+	FROM=$(grep -oP '(?<=from )cache-\S+' <<<"$out" | tr '\n' ' ' || true)
+	BUILD_OUT=$out
+}
+
+
+start_reconciler() {
+	local n=$1
+	# no --verbose: an idle pass would print a line a second into the log, and the
+	# copy lines are the ones worth showing afterwards
+	node_bash "$n" "setsid $TOOLS/reconcile.sh --interval 1 >/tmp/reconcile.log 2>&1 </dev/null & sleep 0.3"
+}
+
+
+# wait_for_ref <node> <tag> : how long the reconciler took to notice.  Diagnostics
+# go to stderr so they do not end up in the caller's captured number.
+wait_for_ref() {
+	local n=$1 tag=$2 start=$SECONDS
+	until registry_tags "$n" | tr ' ' '\n' | grep -qx -- "$tag"; do
+		if ((SECONDS - start < 90)); then
+			sleep 1
+			continue
+		fi
+		node_bash "$n" "tail -5 /tmp/reconcile.log" | sed 's/^/      /' >&2
+		bad "$tag never reached $n"
+		echo -1
+		return 0
+	done
+	echo $((SECONDS - start))
+}
+
+
+# clear_registry <node> : back to "this node has never seen a cache ref".  The
+# data dir is outside /var/lib/docker on purpose, so docker prune does not touch
+# it and a test that wants an empty receiver has to say so.
+clear_registry() {
+	local n=$1
+	# take the container down first: a registry:2 whose data dir is deleted out
+	# from under it keeps running and answers blob uploads with 500s, because its
+	# open handles and storage driver point at an unlinked directory
+	node_bash "$n" "docker rm -f registry >/dev/null 2>&1 || true; sudo rm -rf $REG_DATA/data"
+	ensure_registry "$n"
+}
