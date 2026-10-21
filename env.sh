@@ -504,13 +504,34 @@ node_key() {
 	ls .vagrant/machines/"$n"/*/private_key 2>/dev/null | head -1
 }
 
-node_ssh_ready() {
-	local n=$1 key
-	key="$(node_key "$n")"
-	[[ -n "$key" ]] || return 1
+node_ssh_opts() {
+	local n=$1
+	printf '%s' "-i $(node_key "$n") -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=2"
+}
 
-	ssh -i "$key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-		-o ConnectTimeout=2 "vagrant@$(node_address "$n")" true >/dev/null 2>&1
+node_ssh_ready() {
+	local n=$1
+	[[ -n "$(node_key "$n")" ]] || return 1
+	# shellcheck disable=SC2046
+	ssh $(node_ssh_opts "$n") "vagrant@$(node_address "$n")" true >/dev/null 2>&1
+}
+
+node_ssh() {
+	local n=$1
+	shift
+	# shellcheck disable=SC2046
+	ssh $(node_ssh_opts "$n") "vagrant@$(node_address "$n")" "$@"
+}
+
+# A guest restored from saved state comes back with its clock stopped where the
+# snapshot left it.  Hours of skew is enough for apt to reject Ubuntu's own
+# Release file as "not valid yet", which looks exactly like a broken mirror and
+# is not one.  The host is NTP-synced, so it is the reference.
+sync_clock() {
+	local n=$1 out
+	if ! out=$(node_ssh "$n" "sudo date -u -s @$(date -u +%s)" 2>&1); then
+		echo "env.sh: $n: clock not set: $(tail -1 <<<"$out")" >&2
+	fi
 }
 
 wait_for_nodes() {
@@ -524,6 +545,7 @@ wait_for_nodes() {
 			echo "env.sh: $n never came back" >&2
 			return 1
 		}
+		sync_clock "$n"
 		echo "env.sh: $n reachable"
 	done
 }

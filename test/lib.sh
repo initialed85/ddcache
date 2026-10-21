@@ -151,6 +151,23 @@ require_cluster() {
 		APT_PROXY=
 	fi
 	metric "apt proxy" "${APT_PROXY:-<none>, direct}"
+
+	# A guest restored from saved state wakes up with its clock where the snapshot
+	# left it, and apt then rejects Ubuntu's own Release file as "not valid yet".
+	# That failure looks exactly like a broken mirror, so name it before a build
+	# spends 45s discovering it.
+	local worst=0 skew
+	worst=0
+	for n in "${NODES[@]}"; do
+		skew=$(( $(date +%s) - $(node_bash "$n" 'date +%s') ))
+		if ((skew < 0)); then skew=-skew; fi
+		if ((skew > worst)); then worst=$skew; fi
+	done
+	if ((worst <= 120)); then
+		ok "clocks within ${worst}s of the host"
+	else
+		bad "clocks ${worst}s off the host - ./env.sh restore steps them, otherwise apt fails 'not valid yet'"
+	fi
 }
 
 # A cold builder on the node doing the "warm" build: otherwise a cache hit
