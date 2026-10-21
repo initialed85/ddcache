@@ -89,6 +89,21 @@ which exists to make measurements honest rather than to model the real fleet.
   unless the `ruby-erb` pacman package is installed: Arch builds Vagrant
   against system ruby 3.4, where erb is a bundled gem, and the `vagrant`
   package does not depend on it.
+- `env.sh` reports `no usable Vagrant provider found` when the *system* libvirt
+  daemon is down, which is not the message you want after a reboot: nothing
+  `virt-*` is enabled on edward-desktop *on purpose* - the daemon is only running
+  when Ed wants the cluster, not while he is gaming - and `provider_ready libvirt`
+  needs a live `qemu:///system`.  Start it for the session with `sudo systemctl
+  start virtqemud.socket virtstoraged.socket virtnetworkd.socket virtlogd.socket`,
+  and `./env.sh status` then names the three domains again.  Do not enable these
+  units, and do not assume the plugin is missing.
+- `env.sh restore` failing with `Domain requires KVM, but it is not available` is
+  firmware, not ddcache: `journalctl -k -b | grep -i svm` said `SVM disabled (by
+  BIOS) in MSR_VM_CR`, `modprobe kvm_amd` answers `Operation not supported`, and
+  there is no `/dev/kvm`.  SVM has to be enabled in the BIOS (AMD CBS -> CPU
+  configuration); nothing on the OS side turns it back on.  A firmware "you have a
+  new CPU" re-detection does exactly this - it resets CBS to defaults, and AMD
+  defaults leave SVM off.
 - `lv.cpu_mode = "host-passthrough"` in the Vagrantfile is not a preference.
   The default (`host-model`) writes `<cpu mode='custom'>` with both a `<model>`
   and a `<vendor>`; a later redefine regenerates it without the model and
