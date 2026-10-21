@@ -1,48 +1,40 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# docker.sh - the thing CI would call.  Builds with the registry cache backend and
+# names the ref after the commit, so cache is chosen by git history rather than by
+# whoever wrote to a branch tag last.
+#
+#   ./docker.sh <ctx>          build, export the cache ref, then copy it to every
+#                              peer before returning (the eager shape)
+#   ./docker.sh --local <ctx>  build and export to this node's registry only; the
+#                              peers are not bothered, a reconciler notices later
+#                              (the asynchronous shape, what CI on a fleet wants)
+#   ./docker.sh --no-cache     rebuild from scratch, importing nothing
+#   ./docker.sh --print <ctx>  the plan: which refs would be fetched, which build
+#
+# A build never reads cache across the network.  If a ref this node could use is
+# not in its own registry, docker.sh copies it in first - one bounded wait, paid
+# for in bytes it can print - and then BuildKit talks to localhost only.  So a
+# slow peer shows up as a slow fetch that docker.sh can time, and a dead peer as
+# a build that runs without that cache, never as a step of the build hanging on
+# someone else's machine.
+#
+# Requires: docker with BuildKit, git, jq, skopeo, and registry:2 on this node and
+# on every node in $DDCACHE_NODES (tools/deploy.sh arranges all of that).
 set -euo pipefail
+. "$(dirname "$(readlink -f "$0")")/common.sh"
 
-#
-#  A docker build that knows where it is, and who else is.
-#
-#  usage (on a node, as vagrant):
-#    cd ~/repo && hack, git commit, then:
-#      ~/ddcache/docker.sh .
-#
-#  options:
-#    --local        build and export to this node's registry only.  The ref then
-#                   reaches the other nodes because reconcile.sh notices it, which
-#                   is the asynchronous shape you actually want to watch.
-#    --ref NAME     name the exported ref something other than cache-<branch>-<sha>
-#    --tag NAME     image tag to leave behind (default: the short commit sha)
-#    --no-cache     --no-cache, and ignore what the cluster has
-#    --print        say what it would do, build nothing
-#
-#  What it does:
-#    1. names the ref for this commit
-#    2. asks every registry in the cluster which refs exist for this commit and
-#       its two parents, and imports the best one for each: this branch's ref
-#       beats another branch's, this node beats a peer's
-#    3. builds, and exports mode=max into this node's registry
-#    4. copies the new ref to every peer that does not have it, unless --local
-#
-#  Step 2 is the git-aware bit and the reason the ref is named after a commit:
-#  pointing at "the newest cache on master" instead of "my parent's cache" is what
-#  cost a warm build 46s and zero cached steps in registry-cache.sh.
-#
-
-# shellcheck source=/dev/null
-source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
-
+MODE=push
 ctx=.
-async=0
-ref=
-tag=
+ref=""
+tag=""
 nocache=()
 print_only=0
 
 while (($#)); do
 	case $1 in
-	--local) async=1 ;;
+	--local) MODE=local ;;
+	--no-cache) nocache=(--no-cache) ;;
+	--print) print_only=1 ;;
 	--ref)
 		ref=$2
 		shift
@@ -51,13 +43,12 @@ while (($#)); do
 		tag=$2
 		shift
 		;;
-	--no-cache) nocache=(--no-cache) ;;
-	--print) print_only=1 ;;
 	-*) die "unknown option '$1'" ;;
 	*) ctx=$1 ;;
 	esac
 	shift
 done
+ctx=$(readlink -f "$ctx")
 
 self=$(self_ip)
 sha=$(git -C "$ctx" rev-parse --short HEAD 2>/dev/null) || die "$ctx has no commit to build"
@@ -65,71 +56,95 @@ slug=$(branch_slug "$ctx")
 [[ -n "$slug" && "$slug" != HEAD ]] || die "$ctx is detached; name the ref with --ref"
 ref=${ref:-$(ref_tag "$ctx")}
 tag=${tag:-$sha}
+echo "docker.sh: $(hostname) ($self)"
+echo "docker.sh: ref  $ref"
 
-# own commit, then the two commits behind it.  A build never writes anyone else's
-# ref, which is what makes two nodes building two commits concurrently boring.
+# Candidate commits: this one, then its parents.  A build reads the most specific
+# cache available and falls back down the history, which is why an incomplete
+# replication costs a rebuild rather than a blank run.
 cands=("$sha")
-while read -r h; do cands+=("$h"); done < <(git -C "$ctx" log --format=%h -n 2 "$sha^" 2>/dev/null || true)
+while read -r h; do cands+=("$h"); done < <(git log --format=%h -n 3 "$sha^" 2>/dev/null || true)
 
-# pick_ref <sha> : the "ip ref" to import this commit's cache from, if any.
-pick_ref() {
-	local c
-	c=$(matching "$INV" "$1")
+if ((${#nocache[@]})); then
+	INV=""   # --no-cache means rebuild from scratch, not rebuild after fetching
+else
+	INV=$(inventory)
+fi
+
+# ref_for <sha> : the cache ref holding that commit, preferring this branch's, and
+# the ip of a node whose registry will serve it.  Nothing local means nothing to
+# import, which is the ordinary case on the first commit of a new branch.
+ref_for() {
+	local c line
+	c=$(matching "$INV" "$1")   # matching prepends the dash: tags end -<sha>
 	[[ -z "$c" ]] && return 0
-
 	for f in "^$self cache-${slug}-" "^[^ ]* cache-${slug}-" "^$self " ".*"; do
-		grep -- "$f" <<<"$c" | head -1
-	done | head -1
+		line=$(grep -- "$f" <<<"$c" | head -1)
+		[[ -n "$line" ]] && { echo "$line"; return 0; }
+	done
+	return 0
 }
 
 imports=()
-INV=""
-if ((!${#nocache[@]})); then
-	INV=$(inventory)
-	for cand in "${cands[@]}"; do
-		line=$(pick_ref "$cand" || true)
-		[[ -z "$line" ]] && continue
-		# the first candidate is our own commit: --cache-from and --cache-to naming
-		# the same ref is the rerun case, BuildKit reads the manifest before it
-		# writes one
-		imports+=("$line ${cand}")
-	done
-fi
+fetched=0
+for cand in "${cands[@]}"; do
+	line=$(ref_for "$cand" || true)
+	[[ -z "$line" ]] && continue
+	read -r ip name <<<"$line"
+	if [[ "$ip" == "$self" ]]; then
+		imports+=("$name $self")
+		continue
+	fi
+	# Not here, but someone has it: bring it home before the build starts.
+	if ((fetched)); then
+		echo "docker.sh: not fetching $name, nearer cache already coming"
+		continue
+	fi
+	if ((print_only)); then
+		imports+=("$name $ip (fetch)")
+		continue
+	fi
+	if copy_ref "$ip" "$self" "$name"; then
+		echo "docker.sh: fetched $name from $ip, $(human $BYTES_MOVED) in ${COPY_SECONDS}s"
+		fetched=1
+		imports+=("$name $self")
+	else
+		echo "docker.sh: fetch of $name from $ip failed; building without it"
+	fi
+done
 
-args=(build --progress plain "${nocache[@]+"${nocache[@]}"}" --build-arg "APT_PROXY=${APT_PROXY:-}"
+args=(build --progress plain "${nocache[@]+"${nocache[@]}"}"
+	--build-arg "APT_PROXY=${APT_PROXY:-}"
 	-t "ddcache/spike:${tag}")
 for i in "${imports[@]+"${imports[@]}"}"; do
-	read -r ip name cand <<<"$i"
-	args+=(--cache-from "type=registry,ref=$(reg "$ip")/$REG_REPO:$name")
+	read -r name ip rest <<<"$i"
+	args+=(--cache-from "type=registry,ref=$(reg "$self")/$REG_REPO:$name")
 done
 args+=(--cache-to "type=registry,ref=$(reg "$self")/$REG_REPO:$ref,mode=max,image-manifest=true,oci-mediatypes=true")
 args+=("$ctx")
 
-echo "docker.sh: $(hostname) ($self)"
-echo "docker.sh: ref  $ref"
 for i in "${imports[@]+"${imports[@]}"}"; do
-	read -r ip name cand <<<"$i"
-	printf 'docker.sh: from %s on %s%s\n' "$name" "$ip" "${cand:+ (commit $cand)}"
+	read -r name ip rest <<<"$i"
+	printf 'docker.sh: from %s on %s%s\n' "$name" "$ip" "${rest:+ $rest}"
 done
 ((${#imports[@]})) || echo "docker.sh: from nothing - this cluster has not built $sha or its parents"
 
 if ((print_only)); then
 	printf 'docker.sh: would run: docker'
 	printf ' %q' "${args[@]}"
-	printf '\ndocker.sh: and then replicate %s to: %s\n' "$ref" "$(peers | tr '\n' ' ')"
+	printf '\n'
 	exit 0
 fi
 
 start=$(date +%s)
-if docker "${args[@]}" 2>&1 | tee /tmp/ddcache-build.log; then
-	:
-else
+docker "${args[@]}" >/tmp/ddcache-build.log 2>&1 || {
+	tail -30 /tmp/ddcache-build.log >&2
 	die "build failed, log kept in /tmp/ddcache-build.log"
-fi
+}
 echo "docker.sh: built in $(($(date +%s) - start))s, $(grep -c CACHED /tmp/ddcache-build.log || true) steps were cached"
 
-if ((async)); then
-	echo "docker.sh: --local, leaving $(peers | tr '\n' ' ') to notice"
+if [[ $MODE == local ]]; then
+	echo "docker.sh: --local, leaving $(peers | tr '\n' ' ')to notice"
 	exit 0
 fi
 

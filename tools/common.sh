@@ -53,8 +53,11 @@ ref_tag() {
 
 # tags_on <ip> : the refs that node's registry will serve.  An empty answer is a
 # node with nothing, or a node that isn't up; the reconciler treats them the same.
+# Both timeouts matter: a build or a pass that waits on a registry which is up but
+# uninterested is worse than one that skips it.  5s, because a healthy answer over
+# this network is 2ms.
 tags_on() {
-	curl -sf --connect-timeout 2 "http://$(reg "$1")/v2/$REG_REPO/tags/list" |
+	curl -sf --connect-timeout 2 -m 5 "http://$(reg "$1")/v2/$REG_REPO/tags/list" |
 		jq -r '.tags // [] | .[]' 2>/dev/null || true
 }
 
